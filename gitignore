@@ -1,0 +1,13 @@
+# outputs
+*_rx_strip.png
+*_rx_strip.pdf
+*_rx_strip.svg
+*_combined.tsv
+
+# python
+__pycache__/
+*.pyc
+
+# R
+.Rhistory
+.RData
