@@ -156,7 +156,7 @@ import statistics
 from collections import defaultdict
 from datetime import datetime
 
-__version__ = '1.0.0'
+__version__ = '1.0.4'
 
 # ─── Classification thresholds ──────────────────────────────────────────────
 # Based on Skoglund et al. (2013): Female Rx ~ 1.0, Male Rx ~ 0.5
@@ -175,38 +175,114 @@ FALLBACK_MIN_AUTOSOME_LENGTH = int(os.environ.get('RX_FALLBACK_MIN_AUTOSOME_LENG
 
 # ─── FASTA Parsing ──────────────────────────────────────────────────────────
 
+def _detect_chr_from_accession(acc: str):
+    """
+    Detect chromosome identity from a contig/accession name (when FASTA deflines lack annotations).
+
+    This is intended for assemblies where the contig name itself encodes chromosome IDs, e.g.:
+      - SUPER_X, SUPER_Y, SUPER_1..SUPER_N
+      - chrX, chrY, chr1..chrN
+      - LGX / LG1.. (linkage group style)
+
+    Notes
+    -----
+    Many NCBI accessions include a *version suffix* like '.1' (e.g., CM057420.1).
+    We strip that suffix before tokenizing to avoid mis-identifying the version
+    number as an autosome.
+
+    Returns
+    -------
+    (chr_name, chr_type) where chr_type is 'main' or 'unloc' (best-effort).
+    """
+    # Strip NCBI-style version suffix (e.g., CM057420.1 -> CM057420)
+    acc_up = re.sub(r'\.[0-9]+$', '', acc.upper())
+
+    # Split on non-alphanumerics (underscore, hyphen, dot, etc.)
+    toks_raw = [t for t in re.split(r'[^A-Z0-9]+', acc_up) if t]
+
+    def _strip_prefix(tok: str) -> str:
+        t = tok.upper()
+        for pref in ("CHROMOSOME", "CHROM", "CHR"):
+            if t.startswith(pref) and len(t) > len(pref):
+                return t[len(pref):]
+        # Linkage-group prefix (LG1, LGX)
+        if t.startswith("LG") and len(t) > 2:
+            return t[2:]
+        return t
+
+    # Keep both original and prefix-stripped tokens
+    toks = []
+    for t in toks_raw:
+        toks.append(t)
+        toks.append(_strip_prefix(t))
+    toks = [t for t in toks if t]
+
+    # Flags
+    unloc_flag = any(t in ("UNLOC", "UNLOCALIZED", "RANDOM", "ALT", "HAP", "HAPLOTYPE") for t in toks)
+    scaffold_flag = any(t in ("SCAFFOLD", "SCAF", "SCF", "CONTIG") for t in toks)
+
+    # Sex chromosomes / mitochondrion: whole-token matches only
+    if "X" in toks or "CHRX" in toks:
+        return ("X", "unloc" if unloc_flag else "main")
+    if "Y" in toks or "CHRY" in toks:
+        return ("Y", "unloc" if unloc_flag else "main")
+    if any(t in ("MT", "M", "CHRM", "CHRMT", "MITO", "MITOCHONDRION") for t in toks):
+        return ("MT", "main")
+
+    # Autosomes
+    # Be conservative: avoid calling things like 'Scaffold_35' as chromosome 35.
+    if not scaffold_flag:
+        # If the whole contig is just digits (e.g., '1', '12'), accept as an autosome.
+        if acc_up.isdigit():
+            return (acc_up, "main")
+
+        # If there is an explicit chromosome-ish prefix token, accept numeric tokens.
+        has_chr_context = any(t in ("SUPER", "CHR", "CHROM", "CHROMOSOME", "LG") for t in toks_raw) or                           any(tr.startswith(("CHR", "CHROM", "CHROMOSOME", "LG")) for tr in toks_raw)
+
+        for t in toks:
+            if t.isdigit():
+                # Avoid absurdly large "chromosome" numbers from embedded IDs:
+                # accept 1..999 (covers virtually all vertebrates; still generous).
+                n = int(t)
+                if 1 <= n <= 999 and (has_chr_context or len(t) <= 3):
+                    return (t, "main")
+            # e.g. 3A
+            if re.match(r'^[0-9]+[A-Z]$', t):
+                return (t, "main")
+
+    return (None, None)
+
+
 def parse_fasta_headers(fasta_path, x_contig=None, y_contig=None, mt_contig=None):
     """
     Parse FASTA headers to build an accession-to-chromosome mapping.
 
-    Handles NCBI-style headers where chromosome identity is encoded in
-    the description line, e.g.::
-
-        >CM125500.1 Ictidomys tridecemlineatus isolate ... chromosome X, ...
-
-    Parameters
-    ----------
-    fasta_path : str or Path
-        Path to reference FASTA file (plain text or gzipped).
+    Priority order per contig:
+      1) Explicit overrides (RX_X_CONTIG / --x-contig etc.)
+      2) Defline annotation (e.g., "chromosome X")
+      3) Contig-name heuristics (e.g., SUPER_X, chr1, LGX)
+      4) Fallback "chromosome <token>" parsing
+      5) Otherwise: unplaced/scaffold
 
     Returns
     -------
     dict
-        ``{accession: {'chr': chromosome_name, 'type': 'main'|'unloc'|'scaffold'}}``
+        {accession: {'chr': chromosome_name, 'type': 'main'|'unloc'|'scaffold'}}
     """
     fasta_path = Path(fasta_path)
     mapping = {}
 
     # Optional explicit contig IDs for sex chromosomes / mitochondrion.
-    # These should match BAM @SQ SN: entries exactly (e.g., 'NC_079873.1').
     x_contig = (x_contig or os.environ.get('RX_X_CONTIG') or '').strip() or None
     y_contig = (y_contig or os.environ.get('RX_Y_CONTIG') or '').strip() or None
     mt_contig = (mt_contig or os.environ.get('RX_MT_CONTIG') or '').strip() or None
 
-    # Robust header patterns across common reference FASTA styles
-    x_pat = re.compile(r'(\bchromosome\s*x\b|\bchrx\b)', re.IGNORECASE)
-    y_pat = re.compile(r'(\bchromosome\s*y\b|\bchry\b)', re.IGNORECASE)
+    # Defline patterns (NCBI-like). Note: we intentionally *do not* rely on \bX\b because
+    # underscores are word characters and won't create word boundaries for SUPER_X.
+    x_pat = re.compile(r'chromosome\s+X\b|chrX\b', re.IGNORECASE)
+    y_pat = re.compile(r'chromosome\s+Y\b|chrY\b', re.IGNORECASE)
     mt_pat = re.compile(r'(mitochond\w*|\bmtDNA\b|\bchrM\b|\bchrMT\b|\bMT\b)', re.IGNORECASE)
+    unloc_pat = re.compile(r'(unlocalized|unplaced|random|alternate|alt\b|haplotype|unloc)', re.IGNORECASE)
 
     opener = gzip.open if str(fasta_path).endswith('.gz') else open
     mode = 'rt' if str(fasta_path).endswith('.gz') else 'r'
@@ -220,6 +296,7 @@ def parse_fasta_headers(fasta_path, x_contig=None, y_contig=None, mt_contig=None
 
             header = line[1:].strip()
             accession = header.split()[0]
+            unloc_match = bool(unloc_pat.search(header))
 
             # Explicit overrides first (highest priority)
             if x_contig and accession == x_contig:
@@ -232,39 +309,35 @@ def parse_fasta_headers(fasta_path, x_contig=None, y_contig=None, mt_contig=None
                 mapping[accession] = {'chr': 'MT', 'type': 'main'}
                 continue
 
-            unloc_match = re.search(r'_unloc', header, re.IGNORECASE)
-
-            # Robust detection of sex chromosomes / mitochondrion across header styles
-            acc_up = accession.upper()
-            if acc_up in ('X', 'CHRX'):
+            # NCBI-style defline annotation
+            if x_pat.search(header):
                 mapping[accession] = {'chr': 'X', 'type': 'unloc' if unloc_match else 'main'}
                 continue
-            if acc_up in ('Y', 'CHRY'):
+            if y_pat.search(header):
                 mapping[accession] = {'chr': 'Y', 'type': 'unloc' if unloc_match else 'main'}
                 continue
-            if acc_up in ('MT', 'M', 'CHRM', 'CHRMT'):
+            if mt_pat.search(header):
                 mapping[accession] = {'chr': 'MT', 'type': 'main'}
                 continue
 
-            hay = f"{accession} {header}"
-            if x_pat.search(hay):
-                mapping[accession] = {'chr': 'X', 'type': 'unloc' if unloc_match else 'main'}
-                continue
-            if y_pat.search(hay):
-                mapping[accession] = {'chr': 'Y', 'type': 'unloc' if unloc_match else 'main'}
-                continue
-            if mt_pat.search(hay):
-                mapping[accession] = {'chr': 'MT', 'type': 'main'}
-                continue
+            # Contig-name heuristics (SUPER_X / SUPER_1 / chr12 / LGX, etc.)
+            # Contig-name heuristics (SUPER_X / SUPER_1 / chr12 / LGX, etc.)
+            # Only use these when the FASTA defline does NOT already include a 'chromosome <id>' annotation.
+            if not re.search(r'\bchromosome\b', header, re.IGNORECASE):
+                chr_guess, guess_type = _detect_chr_from_accession(accession)
+                if chr_guess:
+                    mapping[accession] = {'chr': chr_guess, 'type': guess_type or ('unloc' if unloc_match else 'main')}
+                    continue
 
-            # Generic chromosome parsing (e.g., 'chromosome 1', 'chromosome 12', 'chromosome 3A', etc.)
+            # Generic chromosome parsing from defline text
             chr_match = re.search(r'chromosome\s+([^,\s]+)', header, re.IGNORECASE)
             if chr_match:
                 chr_name = chr_match.group(1).strip().rstrip(',').upper()
+                if chr_name in ('M', 'MT'):
+                    chr_name = 'MT'
                 chr_type = 'unloc' if unloc_match else 'main'
                 mapping[accession] = {'chr': chr_name, 'type': chr_type}
             else:
-                # No chromosome annotation in header -> treat as unplaced/scaffold
                 mapping[accession] = {'chr': 'unplaced', 'type': 'scaffold'}
 
     chr_counts = defaultdict(int)
@@ -275,9 +348,6 @@ def parse_fasta_headers(fasta_path, x_contig=None, y_contig=None, mt_contig=None
     print(f"  Chromosomes: {dict(chr_counts)}", file=sys.stderr)
 
     return mapping
-
-
-# ─── Chromosome Classification ──────────────────────────────────────────────
 
 def classify_chromosome(chr_name):
     """Classify a parsed chromosome name as X, Y, autosome, MT, or other."""
