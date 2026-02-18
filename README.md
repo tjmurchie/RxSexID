@@ -111,6 +111,82 @@ Default interpretation thresholds:
 
 ---
 
+## Confidence assignment (Low / Medium / High)
+
+RxSexID reports a **Sex** call plus a heuristic **Confidence** label. Confidence is **not** a formal probability; it is intended as a quick quality flag based on:
+
+- whether an autosomal baseline is reliable,
+- how close **Rx** is to expected **XX (~1.0)** or **XY (~0.5)** values,
+- whether **Ry** agrees (when a Y contig exists in the reference),
+- mapped-read depth (used as a final cap).
+
+### 1) “Insufficient data” overrides everything
+RxSexID returns `Sex=Unknown` and `Confidence=Insufficient data` if it cannot build a stable autosomal baseline or cannot find X in the reference. This happens if any of the following are true:
+
+- median autosomal coverage is 0  
+- too few autosomes/contigs were available for the baseline  
+  - **≥3 autosomes** required when `Autosome_Mode=numbered`  
+  - **≥1 contig** required when using the non-sex fallback mode  
+- total length of baseline autosomal contigs is **< 50,000,000 bp**  
+- no X chromosome/contig is detected in the reference  
+
+### 2) Sex call thresholds
+- **Rx ≥ 0.80 → Female**
+- **Rx ≤ 0.60 → Male**
+- **0.60 < Rx < 0.80 → Ambiguous**
+
+### 3) Confidence rules (summary)
+
+**Female (Rx ≥ 0.80)**
+- **High** if `0.85 ≤ Rx ≤ 1.15` and `Ry < 0.10`
+- **Medium** if `0.80 ≤ Rx ≤ 1.25` and `Ry < 0.20`
+- **Low** otherwise  
+If a Y exists in the reference and `Ry ≥ 0.15`, RxSexID appends a note (possible male contamination or cross-species mismapping), but does not automatically flip the call.
+
+**Male (Rx ≤ 0.60)**
+- If a Y exists in the reference:
+  - **High** if `Ry ≥ 0.20` and Rx is near the expected male range (`0.35–0.65`)
+  - **Medium** if `Ry ≥ 0.05` (or any Y reads) and `0.40 ≤ Rx ≤ 0.60`
+  - **Low** if no Y reads are detected (possible Y degradation or unmappable Y reference)
+- If no Y exists in the reference:
+  - **Medium** if `0.40 ≤ Rx ≤ 0.60`, else **Low**
+
+**Ambiguous (0.60 < Rx < 0.80)**
+- Default: `Sex=Ambiguous`, `Confidence=Low`
+- If a Y exists and `Ry ≥ 0.15`, the label is nudged to **Male** (still low confidence)
+- If a Y exists and `Y_Reads == 0` and `Ry < 0.02`, the label is nudged to **Female** (still low confidence)
+
+### 4) Read-depth cap (defaults)
+Finally, confidence is capped by `Total_Mapped_Reads`:
+
+- `< 100` mapped reads → **Insufficient data**
+- `100–999` mapped reads → **High** is capped to **Medium**
+- `≥ 1000` mapped reads → no cap
+
+
+## Output
+
+Produces a tab-separated file (TSV) with one row per BAM. Typical columns include:
+
+- sample / BAM basename
+- Rx estimate
+- counts / coverage stats used to compute Rx
+- optional QC fields (depending on script configuration)
+
+---
+
+## Recommended BAM preprocessing (aDNA)
+
+Your mapping and filters matter a lot. Typical aDNA-ready preprocessing includes:
+
+- remove PCR duplicates
+- minimum mapping quality filter (e.g., MQ ≥ 30)
+- optional minimum read length filter (e.g., ≥ 24 bp)
+- consider excluding problematic contigs (unplaced/alt/decoy) if they inflate noise
+
+---
+
+
 ## Documentation
 - **`README_rx_sex_id.md`** — details for the Python sex inference script
 - **`README_RxSexIDPlotter.md`** — details for the plotting script
